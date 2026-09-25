@@ -56,6 +56,7 @@ class Settings:
     data_dir: Path
     telegram_token: str
     chat_id: str
+    max_daily_loss_pct: float
 
     @classmethod
     def load(cls, allow_unconfigured_live=False):
@@ -67,17 +68,18 @@ class Settings:
                 setting_float("STOP_LOSS_PCT", "0.04"), setting_float("TAKE_PROFIT_PCT", "0.08"),
                 setting_float("FEE_RATE", "0.004"), setting_float("SLIPPAGE_RATE", "0.001"),
                 Path(os.getenv("DATA_DIR", "./data")), os.getenv("TELEGRAM_BOT_TOKEN", ""),
-                os.getenv("TELEGRAM_CHAT_ID", ""))
+                os.getenv("TELEGRAM_CHAT_ID", ""), setting_float("MAX_DAILY_LOSS_PCT", "0.03"))
         if s.mode not in {"paper", "live"} or s.symbol not in {"BTC/EUR", "ETH/EUR"}:
             raise ValueError("MODE muss paper/live sein; SYMBOL muss BTC/EUR oder ETH/EUR sein")
         if s.timeframe not in {"1h", "4h"} or s.paper_start <= 0 or s.trade_eur <= 0:
             raise ValueError("Ungültiger Zeitrahmen oder Einsatz")
         if not all(math.isfinite(x) for x in (s.paper_start, s.trade_eur, s.max_position,
-                                               s.buy, s.sell, s.stop, s.take, s.fee, s.slip)):
+                                               s.buy, s.sell, s.stop, s.take, s.fee, s.slip, s.max_daily_loss_pct)):
             raise ValueError("Alle numerischen Einstellungen müssen endlich sein")
         if not (0.5 <= s.buy <= 0.9 and 0.1 <= s.sell < s.buy and
                 0 < s.stop <= 0.25 and 0 < s.take <= 0.5 and
-                0 <= s.fee <= 0.03 and 0 <= s.slip <= 0.03 and s.max_position >= s.trade_eur):
+                0 <= s.fee <= 0.03 and 0 <= s.slip <= 0.03 and s.max_position >= s.trade_eur and
+                0.001 <= s.max_daily_loss_pct <= 0.25):
             raise ValueError("Ungültige Grenzwerte oder Positionsgröße")
         if s.mode == "live" and not allow_unconfigured_live and (os.getenv("ENABLE_LIVE_TRADING") != "YES" or
                                   not os.getenv("KRAKEN_API_KEY") or not os.getenv("KRAKEN_API_SECRET")):
@@ -234,6 +236,66 @@ class Trader:
                 f"Max. Rückgang: {result['max_drawdown_pct']:.2f}% | Ausführungen: {result['trades']}\n"
                 "Starttraining: erste 70 %; danach je Kerze nur mit bekannten älteren Daten neu trainiert. Keine Gewinnprognose.")
 
+    def equity(self, price=None):
+        if self.s.mode != "paper":
+            return None
+        cash = float(self.store.get("cash", 0))
+        units = float(self.store.get("units", 0))
+        if price is None:
+            try:
+                price = float(self.exchange.fetch_ticker(self.s.symbol).get("last") or 0)
+            except Exception:
+                price = 0.0
+        return cash + units * float(price or 0)
+
+    def enforce_daily_loss_limit(self, price):
+        if self.s.mode != "paper":
+            return False
+        today = datetime.now(timezone.utc).date().isoformat()
+        equity = self.equity(price)
+        day = self.store.get("risk_day")
+        start = float(self.store.get("day_start_equity", equity) or equity)
+        if day != today or start <= 0:
+            self.store.put(risk_day=today, day_start_equity=equity)
+            return False
+        loss = max(0.0, 1 - equity / start)
+        if loss >= self.s.max_daily_loss_pct:
+            self.store.put(paused=True)
+            self.telegram.send(f"RISIKO-STOP: Tagesverlust {loss:.2%} erreicht (Limit {self.s.max_daily_loss_pct:.2%}). Bot pausiert.")
+            return True
+        return False
+
+    def trade_stats(self):
+        rows = self.store.db.execute("SELECT side,qty,price,fee FROM trades ORDER BY id").fetchall()
+        buys = sells = 0
+        realized = 0.0
+        basis_qty = basis_cost = 0.0
+        fees = 0.0
+        for side, qty, price, fee in rows:
+            qty, price, fee = float(qty), float(price), float(fee)
+            fees += fee
+            if side == "buy":
+                buys += 1; basis_qty += qty; basis_cost += qty * price + fee
+            elif side == "sell":
+                sells += 1
+                avg = basis_cost / basis_qty if basis_qty > 0 else 0
+                sold_cost = avg * min(qty, basis_qty)
+                realized += qty * price - fee - sold_cost
+                if basis_qty > 0:
+                    frac = min(1.0, qty / basis_qty); basis_qty *= (1-frac); basis_cost *= (1-frac)
+        return buys, sells, realized, fees
+
+    def watchlist_report(self):
+        lines = [f"WATCHLIST | {self.s.timeframe} | {self.s.mode.upper()}"]
+        for symbol in ("BTC/EUR", "ETH/EUR"):
+            raw = self.exchange.fetch_ohlcv(symbol, self.s.timeframe, limit=720)
+            frame = feature_frame([[int(r[0]), *map(float, r[1:6])] for r in raw[:-1]])
+            model = fit_model(frame.iloc[:-2]); p = probability(model, frame.iloc[[-1]])
+            signal = "BUY-Zone" if p >= self.s.buy else ("SELL-Zone" if p <= self.s.sell else "HOLD-Zone")
+            lines.append(f"{symbol}: {frame.close.iloc[-1]:.2f} EUR | Score {p:.1%} | {signal}")
+        lines.append(f"Automatische Ausführung nur für {self.s.symbol}; Watchlist ist Analyse.")
+        return "\n".join(lines)
+
     def live_free(self, asset):
         try:
             bal = self.exchange.fetch_balance()
@@ -299,6 +361,8 @@ class Trader:
         if self.store.get("paused"):
             return None
         price = float(frame.close.iloc[-1])
+        if self.enforce_daily_loss_limit(price):
+            return None
         units = float(self.store.get("units", 0))
         entry = float(self.store.get("entry", 0))
         if not all(math.isfinite(x) and x >= 0 for x in (price, units, entry)) or price == 0:
@@ -364,7 +428,14 @@ class Trader:
 
     def handle(self, command):
         if command == "/help" or command == "/start":
-            return "/scan /status /backtest /pause /resume /help"
+            return "/scan /watch /status /stats /backtest /pause /resume /help"
+        if command == "/watch":
+            return self.watchlist_report()
+        if command == "/stats":
+            buys, sells, realized, fees = self.trade_stats()
+            eq = self.equity() if self.s.mode == "paper" else None
+            extra = f" | Equity: {eq:.2f} EUR" if eq is not None else ""
+            return f"Trades: {buys} Käufe / {sells} Verkäufe | Realisiert: {realized:+.2f} EUR | Gebühren: {fees:.2f} EUR{extra}"
         if command == "/status":
             return (f"{self.s.mode.upper()} | Pause: {self.store.get('paused')} | "
                     f"Ungeklärte Order: {self.store.get('pending')} | "
