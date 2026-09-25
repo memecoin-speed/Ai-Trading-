@@ -1,0 +1,5 @@
+ccxt==4.5.84
+numpy==2.3.5
+pandas==2.2.3
+scikit-learn==1.8.0
+python-dotenv==1.2.3
