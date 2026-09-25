@@ -515,6 +515,28 @@ class Trader:
         return "Unbekannt. /help zeigt die Befehle."
 
 
+_HEAVY_JOB_LOCK = threading.Lock()
+
+
+def _run_heavy_telegram_job(bot: Trader, command: str) -> None:
+    """Run expensive validation away from Telegram polling and report every outcome."""
+    label = "Validierung" if command == "/validate" else "Robustheitstest"
+    if not _HEAVY_JOB_LOCK.acquire(blocking=False):
+        bot.telegram.send("⏳ Es läuft bereits eine Validierung. Bitte warte auf das Ergebnis.")
+        return
+    try:
+        LOG.info("Telegram %s gestartet", command)
+        started = time.monotonic()
+        result = bot.validation_report() if command == "/validate" else bot.robustness_report()
+        LOG.info("Telegram %s abgeschlossen nach %.1fs", command, time.monotonic() - started)
+        bot.telegram.send(result)
+    except Exception as exc:  # noqa: BLE001 - report command failures without killing bot
+        LOG.exception("Telegram %s fehlgeschlagen", command)
+        bot.telegram.send(f"❌ {label} fehlgeschlagen: {safe_error(exc)[:500]}")
+    finally:
+        _HEAVY_JOB_LOCK.release()
+
+
 def run_once(bot: Trader, next_scan: float) -> float:
     """Keep scanning even when Telegram command polling is unavailable."""
     try:
@@ -523,13 +545,21 @@ def run_once(bot: Trader, next_scan: float) -> float:
         LOG.warning("Telegram-Abruf fehlgeschlagen: %s", exc)
         updates = []
     for update_id, command in updates:
+        # Acknowledge immediately so a long validation can never stall/replay polling.
+        bot.telegram.ack(update_id)
         try:
-            if command:
+            if command in {"/validate", "/robust"}:
+                label = "Validierung" if command == "/validate" else "Robustheitstest"
+                LOG.info("Telegram-Befehl empfangen: %s", command)
+                bot.telegram.send(f"⏳ {label} gestartet. Der Bot bleibt währenddessen erreichbar.")
+                threading.Thread(target=_run_heavy_telegram_job, args=(bot, command),
+                                 name=f"telegram-{command[1:]}", daemon=True).start()
+            elif command:
+                LOG.info("Telegram-Befehl empfangen: %s", command)
                 bot.telegram.send(bot.handle(command))
         except Exception as exc:  # noqa: BLE001 - one command must not block the scan
-            LOG.warning("Telegram-Befehl fehlgeschlagen: %s", exc)
-            bot.telegram.send("Befehl fehlgeschlagen. Bitte später erneut versuchen.")
-        bot.telegram.ack(update_id)
+            LOG.exception("Telegram-Befehl %s fehlgeschlagen", command)
+            bot.telegram.send(f"Befehl fehlgeschlagen: {safe_error(exc)[:500]}")
     if time.monotonic() >= next_scan:
         next_scan = time.monotonic() + 60
         frame, p = bot.analysis()
