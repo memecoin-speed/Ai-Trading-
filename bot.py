@@ -122,10 +122,24 @@ class Telegram:
     def request(self, method, params):
         data = urllib.parse.urlencode(params).encode()
         request = urllib.request.Request(f"https://api.telegram.org/bot{self.token}/{method}", data=data)
-        with urllib.request.urlopen(request, timeout=12) as response:
-            result = json.load(response)
+        try:
+            with urllib.request.urlopen(request, timeout=12) as response:
+                result = json.load(response)
+        except urllib.error.HTTPError as exc:
+            # Telegram returns useful JSON such as 401 Unauthorized, 400 chat not found,
+            # or 409 Conflict. Log only the status/description, never the bot token/URL.
+            try:
+                payload = json.loads(exc.read().decode("utf-8", errors="replace"))
+                description = str(payload.get("description") or "HTTP error")[:300]
+                error_code = payload.get("error_code", exc.code)
+            except Exception:
+                error_code = exc.code
+                description = str(exc.reason or "HTTP error")[:300]
+            raise RuntimeError(f"Telegram API HTTP {error_code}: {description}") from None
         if not result.get("ok"):
-            raise RuntimeError("Telegram API-Fehler")
+            code = result.get("error_code", "?")
+            description = str(result.get("description") or "API error")[:300]
+            raise RuntimeError(f"Telegram API {code}: {description}")
         return result["result"]
 
     def send(self, message):
@@ -133,7 +147,7 @@ class Telegram:
             try:
                 self.request("sendMessage", {"chat_id": self.chat_id, "text": message[:3900]})
             except Exception as exc:  # noqa: BLE001 - notification failure must not stop trading loop
-                LOG.warning("Telegram-Nachricht fehlgeschlagen (%s)", type(exc).__name__)
+                LOG.warning("Telegram-Nachricht fehlgeschlagen: %s", exc)
         print(message, flush=True)
 
     def updates(self):
@@ -378,14 +392,14 @@ def run_once(bot: Trader, next_scan: float) -> float:
     try:
         updates = bot.telegram.updates()
     except Exception as exc:  # noqa: BLE001 - Telegram is optional for autonomous scans
-        LOG.warning("Telegram-Abruf fehlgeschlagen (%s)", type(exc).__name__)
+        LOG.warning("Telegram-Abruf fehlgeschlagen: %s", exc)
         updates = []
     for update_id, command in updates:
         try:
             if command:
                 bot.telegram.send(bot.handle(command))
         except Exception as exc:  # noqa: BLE001 - one command must not block the scan
-            LOG.warning("Telegram-Befehl fehlgeschlagen (%s)", type(exc).__name__)
+            LOG.warning("Telegram-Befehl fehlgeschlagen: %s", exc)
             bot.telegram.send("Befehl fehlgeschlagen. Bitte später erneut versuchen.")
         bot.telegram.ack(update_id)
     if time.monotonic() >= next_scan:
