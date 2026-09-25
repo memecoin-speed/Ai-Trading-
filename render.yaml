@@ -1,12 +1,9 @@
 services:
-  - type: worker
+  - type: web
     name: kraken-ai-paper-bot
     runtime: docker
-    plan: starter
-    disk:
-      name: bot-data
-      mountPath: /app/data
-      sizeGB: 1
+    plan: free
+    healthCheckPath: /health
     envVars:
       - key: MODE
         value: paper
@@ -19,7 +16,7 @@ services:
       - key: MAX_POSITION_EUR
         value: '50'
       - key: DATA_DIR
-        value: /app/data
+        value: /tmp/bot-data
       - key: TELEGRAM_BOT_TOKEN
         sync: false
       - key: TELEGRAM_CHAT_ID

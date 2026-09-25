@@ -12,6 +12,8 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -417,6 +419,33 @@ def lock_path(settings: Settings) -> Path:
     return settings.data_dir / f"{settings.mode}_{settings.symbol.replace('/', '_')}.lock"
 
 
+
+def start_health_server():
+    """Bind Render's PORT so the long-running bot can use a Web Service plan."""
+    port = int(os.getenv("PORT", "10000"))
+
+    class HealthHandler(BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path in {"/", "/health", "/healthz"}:
+                body = b"Kraken AI Trading Bot: OK\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, fmt, *args):
+            return
+
+    server = ThreadingHTTPServer(("0.0.0.0", port), HealthHandler)
+    thread = threading.Thread(target=server.serve_forever, name="render-health", daemon=True)
+    thread.start()
+    LOG.info("Render health server listening on port %s", port)
+    return server
+
 def main():
     parser = argparse.ArgumentParser(description="Kraken AI trading bot")
     parser.add_argument("command", choices=["run", "scan", "backtest", "status", "chat-id", "init-live"], nargs="?", default="run")
@@ -447,6 +476,8 @@ def main():
     if args.command == "status":
         print(offline_status(s))
         return
+    if args.command == "run":
+        start_health_server()
     bot = Trader(s)
     if args.command != "run":
         print(bot.handle("/" + args.command))
