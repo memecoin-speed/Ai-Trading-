@@ -21,7 +21,7 @@ from pathlib import Path
 import ccxt
 from dotenv import load_dotenv
 
-from model import evaluate, feature_frame, fit_model, probability
+from model import evaluate, feature_frame, fit_model, nested_validate, probability
 
 LOG = logging.getLogger("trader")
 
@@ -56,7 +56,9 @@ class Settings:
     data_dir: Path
     telegram_token: str
     chat_id: str
-    max_daily_loss_pct: float
+    max_daily_loss_pct: float = 0.03
+    max_drawdown_pct: float = 0.10
+    trailing_stop_pct: float = 0.03
 
     @classmethod
     def load(cls, allow_unconfigured_live=False):
@@ -68,18 +70,20 @@ class Settings:
                 setting_float("STOP_LOSS_PCT", "0.04"), setting_float("TAKE_PROFIT_PCT", "0.08"),
                 setting_float("FEE_RATE", "0.004"), setting_float("SLIPPAGE_RATE", "0.001"),
                 Path(os.getenv("DATA_DIR", "./data")), os.getenv("TELEGRAM_BOT_TOKEN", ""),
-                os.getenv("TELEGRAM_CHAT_ID", ""), setting_float("MAX_DAILY_LOSS_PCT", "0.03"))
+                os.getenv("TELEGRAM_CHAT_ID", ""), setting_float("MAX_DAILY_LOSS_PCT", "0.03"),
+                setting_float("MAX_DRAWDOWN_PCT", "0.10"), setting_float("TRAILING_STOP_PCT", "0.03"))
         if s.mode not in {"paper", "live"} or s.symbol not in {"BTC/EUR", "ETH/EUR"}:
             raise ValueError("MODE muss paper/live sein; SYMBOL muss BTC/EUR oder ETH/EUR sein")
         if s.timeframe not in {"1h", "4h"} or s.paper_start <= 0 or s.trade_eur <= 0:
             raise ValueError("Ungültiger Zeitrahmen oder Einsatz")
         if not all(math.isfinite(x) for x in (s.paper_start, s.trade_eur, s.max_position,
-                                               s.buy, s.sell, s.stop, s.take, s.fee, s.slip, s.max_daily_loss_pct)):
+                                               s.buy, s.sell, s.stop, s.take, s.fee, s.slip, s.max_daily_loss_pct, s.max_drawdown_pct, s.trailing_stop_pct)):
             raise ValueError("Alle numerischen Einstellungen müssen endlich sein")
         if not (0.5 <= s.buy <= 0.9 and 0.1 <= s.sell < s.buy and
                 0 < s.stop <= 0.25 and 0 < s.take <= 0.5 and
                 0 <= s.fee <= 0.03 and 0 <= s.slip <= 0.03 and s.max_position >= s.trade_eur and
-                0.001 <= s.max_daily_loss_pct <= 0.25):
+                0.001 <= s.max_daily_loss_pct <= 0.25 and 0.01 <= s.max_drawdown_pct <= 0.5 and
+                0 <= s.trailing_stop_pct <= 0.25):
             raise ValueError("Ungültige Grenzwerte oder Positionsgröße")
         if s.mode == "live" and not allow_unconfigured_live and (os.getenv("ENABLE_LIVE_TRADING") != "YES" or
                                   not os.getenv("KRAKEN_API_KEY") or not os.getenv("KRAKEN_API_SECRET")):
@@ -230,11 +234,49 @@ class Trader:
         frame = frame if frame is not None else self.candles()
         result = evaluate(frame, self.s.fee, self.s.slip, self.s.buy, self.s.sell,
                           self.s.paper_start, self.s.trade_eur, self.s.max_position,
-                          self.s.stop, self.s.take)
-        return (f"Historischer Test: {result['test_bars']} Kerzen (letzte 30 %)\n"
-                f"Strategie: {result['return_pct']:+.2f}% | Kaufen & halten: {result['buy_hold_pct']:+.2f}%\n"
-                f"Max. Rückgang: {result['max_drawdown_pct']:.2f}% | Ausführungen: {result['trades']}\n"
-                "Starttraining: erste 70 %; danach je Kerze nur mit bekannten älteren Daten neu trainiert. Keine Gewinnprognose.")
+                          self.s.stop, self.s.take, self.s.trailing_stop_pct)
+        pf = result["profit_factor"]
+        pf_text = "∞" if pf == float("inf") else f"{pf:.2f}"
+        return (f"WALK-FORWARD BACKTEST | {self.s.symbol} | {self.s.timeframe}\n"
+                f"Out-of-sample: {result['test_bars']} Kerzen (letzte 30 %)\n"
+                f"Strategie nach Kosten: {result['return_pct']:+.2f}% | Buy & Hold: {result['buy_hold_pct']:+.2f}%\n"
+                f"Differenz zu Buy & Hold: {result['excess_pct']:+.2f} Prozentpunkte\n"
+                f"Max Drawdown: {result['max_drawdown_pct']:.2f}%\n"
+                f"Geschlossene Trades: {result['closed_trades']} | Trefferquote: {result['win_rate_pct']:.1f}% | Profit-Factor: {pf_text}\n"
+                f"Entries/Exits: {result['entries']}/{result['exits']} | Position am Testende: {'offen' if result['open_position'] else 'keine'}\n"
+                "Walk-forward: pro Kerze nur zu diesem Zeitpunkt bekannte Daten; Gebühren und Slippage berücksichtigt. Keine Gewinnprognose.")
+
+    def validation_report(self, symbol=None, timeframe=None):
+        symbol = symbol or self.s.symbol
+        timeframe = timeframe or self.s.timeframe
+        raw = self.exchange.fetch_ohlcv(symbol, timeframe, limit=720)
+        frame = feature_frame([[int(r[0]), *map(float, r[1:6])] for r in raw[:-1]])
+        r = nested_validate(frame, self.s.fee, self.s.slip, self.s.paper_start,
+                            self.s.trade_eur, self.s.max_position, self.s.stop,
+                            self.s.take, self.s.trailing_stop_pct)
+        pf = r["profit_factor"]
+        pf_text = "∞" if pf == float("inf") else f"{pf:.2f}"
+        return (f"NESTED OOS | {symbol} | {timeframe}\n"
+                f"Tuning: {r['tuning_bars']} Kerzen | final unangetastet: {r['test_bars']} Kerzen\n"
+                f"Gewählte Schwellen nur aus Tuning: BUY {r['selected_buy']:.0%} / SELL {r['selected_sell']:.0%}\n"
+                f"Strategie: {r['return_pct']:+.2f}% | Buy&Hold: {r['buy_hold_pct']:+.2f}% | Differenz: {r['excess_pct']:+.2f}pp\n"
+                f"Drawdown: {r['max_drawdown_pct']:.2f}% | Trades: {r['closed_trades']} | Treffer: {r['win_rate_pct']:.1f}% | PF: {pf_text}\n"
+                f"Richtungsgenauigkeit: {r['direction_accuracy_pct']:.1f}% | Brier: {r['brier']}")
+
+    def robustness_report(self):
+        lines = ["ROBUSTHEIT | Nested Out-of-Sample | keine Gewinnprognose"]
+        for symbol, timeframe in (("BTC/EUR","1h"),("BTC/EUR","4h"),("ETH/EUR","1h"),("ETH/EUR","4h")):
+            try:
+                raw = self.exchange.fetch_ohlcv(symbol, timeframe, limit=720)
+                frame = feature_frame([[int(r[0]), *map(float, r[1:6])] for r in raw[:-1]])
+                r = nested_validate(frame, self.s.fee, self.s.slip, self.s.paper_start,
+                                    self.s.trade_eur, self.s.max_position, self.s.stop,
+                                    self.s.take, self.s.trailing_stop_pct)
+                pf = r["profit_factor"]; pft = "∞" if pf == float("inf") else f"{pf:.2f}"
+                lines.append(f"{symbol} {timeframe}: {r['return_pct']:+.2f}% | vs B&H {r['excess_pct']:+.2f}pp | DD {r['max_drawdown_pct']:.1f}% | PF {pft} | {r['closed_trades']} Trades")
+            except Exception as exc:
+                lines.append(f"{symbol} {timeframe}: Fehler {safe_error(exc)[:100]}")
+        return "\n".join(lines)
 
     def equity(self, price=None):
         if self.s.mode != "paper":
@@ -259,9 +301,14 @@ class Trader:
             self.store.put(risk_day=today, day_start_equity=equity)
             return False
         loss = max(0.0, 1 - equity / start)
+        total_dd = max(0.0, 1 - equity / self.s.paper_start)
         if loss >= self.s.max_daily_loss_pct:
             self.store.put(paused=True)
             self.telegram.send(f"RISIKO-STOP: Tagesverlust {loss:.2%} erreicht (Limit {self.s.max_daily_loss_pct:.2%}). Bot pausiert.")
+            return True
+        if total_dd >= self.s.max_drawdown_pct:
+            self.store.put(paused=True)
+            self.telegram.send(f"DRAWDOWN-STOP: Equity {equity:.2f} EUR, Verlust seit Start {total_dd:.2%}. Bot pausiert.")
             return True
         return False
 
@@ -368,8 +415,13 @@ class Trader:
         if not all(math.isfinite(x) and x >= 0 for x in (price, units, entry)) or price == 0:
             raise RuntimeError("Ungültige Positions- oder Marktdaten; kein Trade ausgeführt")
         side = None
+        peak_price = float(self.store.get("peak_price", entry) or entry)
+        if units > 0:
+            peak_price = max(peak_price, price)
+            self.store.put(peak_price=peak_price)
+        trailing_hit = units > 0 and self.s.trailing_stop_pct > 0 and price <= peak_price * (1 - self.s.trailing_stop_pct)
         if units > 0 and (p <= self.s.sell or price <= entry * (1 - self.s.stop) or
-                          price >= entry * (1 + self.s.take)):
+                          price >= entry * (1 + self.s.take) or trailing_hit):
             side = "sell"
         elif units == 0 and p >= self.s.buy:
             side = "buy"
@@ -378,7 +430,8 @@ class Trader:
             return None
         if side == "buy":
             cash = self.live_free(self.market["quote"]) if self.s.mode == "live" else float(self.store.get("cash"))
-            spend = min(self.s.trade_eur, self.s.max_position, cash * 0.95)
+            strength = min(1.5, max(0.5, 0.5 + (p - self.s.buy) / max(1e-6, 1 - self.s.buy)))
+            spend = min(self.s.trade_eur * strength, self.s.max_position, cash * 0.95)
             # Reserve estimated fees inside the configured EUR spend.
             quote_cost = spend / (1 + self.s.fee)
             qty = float(self.exchange.amount_to_precision(self.s.symbol, quote_cost / (price * (1 + self.s.slip))))
@@ -389,7 +442,7 @@ class Trader:
                 fill = price * (1 + self.s.slip)
                 fee = qty * fill * self.s.fee
                 fields = {"cash": cash - qty * fill - fee, "units": qty, "entry": fill,
-                          "last_candle": candle}
+                          "peak_price": fill, "last_candle": candle}
                 order_id = "paper"
             else:
                 qty, fill, order_id, base_fee, quote_fee = self.live_order("buy", qty, quote_cost)
@@ -415,7 +468,7 @@ class Trader:
                 fill = price * (1 - self.s.slip)
                 fee = qty * fill * self.s.fee
                 cash = float(self.store.get("cash")) + qty * fill - fee
-                fields = {"cash": cash, "units": 0.0, "entry": 0.0, "last_candle": candle}
+                fields = {"cash": cash, "units": 0.0, "entry": 0.0, "peak_price": 0.0, "last_candle": candle}
                 order_id = "paper"
         self.store.record_fill(fields, side, qty, fill, fee, self.s.mode, order_id)
         return f"{self.s.mode.upper()} {side.upper()}: {qty:.8f} {self.market['base']} zu ca. {fill:.2f} EUR | Modell {p:.1%}"
@@ -428,7 +481,7 @@ class Trader:
 
     def handle(self, command):
         if command == "/help" or command == "/start":
-            return "/scan /watch /status /stats /backtest /pause /resume /help"
+            return "/scan /watch /status /stats /backtest /validate /robust /pause /resume /help"
         if command == "/watch":
             return self.watchlist_report()
         if command == "/stats":
@@ -455,6 +508,10 @@ class Trader:
             return self.report(frame, p)
         if command == "/backtest":
             return self.backtest()
+        if command == "/validate":
+            return self.validation_report()
+        if command == "/robust":
+            return self.robustness_report()
         return "Unbekannt. /help zeigt die Befehle."
 
 

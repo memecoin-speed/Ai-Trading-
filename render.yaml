@@ -17,6 +17,10 @@ services:
         value: '50'
       - key: MAX_DAILY_LOSS_PCT
         value: '0.03'
+      - key: MAX_DRAWDOWN_PCT
+        value: '0.10'
+      - key: TRAILING_STOP_PCT
+        value: '0.03'
       - key: DATA_DIR
         value: /tmp/bot-data
       - key: TELEGRAM_BOT_TOKEN

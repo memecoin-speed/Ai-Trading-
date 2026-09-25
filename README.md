@@ -74,3 +74,10 @@ python -m unittest discover -s tests -v
 ```
 
 Die Tests benötigen kein Konto. Ein echter API-Abruf und Echtgeldorders wurden in der Erstellungsumgebung nicht durchgeführt.
+
+## Final Paper Validation Upgrade
+- `/validate`: nested out-of-sample validation. Thresholds are selected only on a middle tuning window; the final 30% remains untouched until scoring.
+- `/robust`: repeats nested validation for BTC/EUR and ETH/EUR on 1h and 4h.
+- Confidence-bounded paper position sizing, trailing stop, daily loss stop, and total drawdown stop.
+- Fees and slippage are included in validation. Brier score, direction accuracy, profit factor and max drawdown are reported.
+- Keep `MODE=paper` during forward validation. Historical results are not a profit guarantee.
